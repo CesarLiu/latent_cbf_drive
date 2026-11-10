@@ -26,13 +26,55 @@ checkpoint. ``scripts/driving/check_smart_imagination.py`` compares it with
 from __future__ import annotations
 
 import sys
-from typing import Dict, Iterable, Iterator, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 import torch
 from torch import Tensor
 
 from ..hj.imagination import Candidates, Imagination
-from ..stl.rules import BIG, circle_cover
+from ..stl.rules import BIG, circle_cover, point_segment_distance
+
+# CAT-K map encoding (src/data_preprocess.py): ``pt_token.pl_type`` indexes
+# ["lane", "road_edge", "road_line", "crosswalk"]; ``pt_token.type`` is the
+# fine-grained polyline type.
+ROAD_EDGE_POLYGON = 1
+ROAD_EDGE_BOUNDARY, ROAD_EDGE_MEDIAN = 4, 5
+
+
+def pad_edge_segments(traj_pos: Tensor, is_edge: Tensor, batch: Tensor, num_graphs: int):
+    """Road-edge segments of every scene, padded to a common length.
+
+    Args:
+        traj_pos: [n_pl, P, 2] map polyline pieces (CAT-K ``map_save.traj_pos``,
+            P = 3 points per piece), is_edge: [n_pl] bool, batch: [n_pl] scene id.
+    Returns:
+        seg_a, seg_b [num_graphs, M, 2] and mask [num_graphs, M].
+    """
+    pts = traj_pos[is_edge].float()
+    n_seg = pts.shape[1] - 1
+    seg_a, seg_b = pts[:, :-1].flatten(0, 1), pts[:, 1:].flatten(0, 1)
+    scene = batch[is_edge].long().repeat_interleave(n_seg)
+    order = torch.argsort(scene, stable=True)
+    scene, seg_a, seg_b = scene[order], seg_a[order], seg_b[order]
+    counts = torch.bincount(scene, minlength=num_graphs)
+    slot = torch.arange(scene.shape[0], device=scene.device) - (counts.cumsum(0) - counts)[scene]
+    m = max(int(counts.max()) if counts.numel() else 0, 1)
+    out_a = pts.new_zeros(num_graphs, m, 2)
+    out_b = pts.new_zeros(num_graphs, m, 2)
+    mask = torch.zeros(num_graphs, m, dtype=torch.bool, device=pts.device)
+    out_a[scene, slot], out_b[scene, slot], mask[scene, slot] = seg_a, seg_b, True
+    return out_a, out_b, mask
+
+
+def road_edge_gap(centers: Tensor, radius: Tensor, seg_a: Tensor, seg_b: Tensor,
+                  mask: Tensor) -> Tensor:
+    """Gap [B] between discs (centers [B, P, 2], radius [B]) and road-edge segments.
+
+    The distance is unsigned: it is negative only while a disc overlaps an edge.
+    """
+    dist = point_segment_distance(centers, seg_a, seg_b)  # [B, P, M]
+    dist = dist.masked_fill(~mask.unsqueeze(1), BIG)
+    return dist.amin(dim=(1, 2)) - radius
 
 
 def angle_between_2d_vectors(ctr_vector: Tensor, nbr_vector: Tensor) -> Tensor:
@@ -112,6 +154,10 @@ class SmartImagination(Imagination):
         clearance_scale: float = 2.0,
         min_clearance: float = 0.0,
         n_circles: int = 3,
+        road_edge: bool = True,
+        road_edge_scale: float = 1.0,
+        min_road_edge: float = 0.0,
+        road_edge_types: Optional[Sequence[int]] = None,
         device: Optional[str] = None,
     ) -> None:
         """
@@ -124,7 +170,16 @@ class SmartImagination(Imagination):
                 CAT-K's ``validation_rollout_sampling``.
             clearance_scale, min_clearance: map the ego's clearance in metres to
                 the margin returned by ``true_margin``.
+            road_edge: add the road-edge rule to ``true_margin``. The ego body
+                is checked against the scene's road-edge polylines at every
+                0.1 s pose of the executed token, so an edge crossed inside a
+                0.5 s step is not missed.
+            road_edge_scale, min_road_edge: as above, for the road-edge gap.
+            road_edge_types: fine-grained ``pt_token.type`` values to keep, e.g.
+                ``(ROAD_EDGE_BOUNDARY,)`` to ignore medians. None keeps all.
         """
+        self.road_edge, self.road_edge_types = road_edge, road_edge_types
+        self.road_edge_scale, self.min_road_edge = road_edge_scale, min_road_edge
         self.token_processor = token_processor
         self.map_encoder = decoder.map_encoder
         self.dec = decoder.agent_encoder
@@ -193,8 +248,29 @@ class SmartImagination(Imagination):
         if self.ego.numel() != ta["num_graphs"]:
             raise ValueError("expected exactly one ego agent per scene")
         self.t = 0
+        self._setup_road_edges(data)
         self._encode()
         return self.latent()
+
+    def _setup_road_edges(self, data) -> None:
+        self._ego_sweep = None  # [B, S, 4, 2] contours of the last executed ego token
+        self._edges = None
+        n_scene = self.ego.numel()
+        self.edge_active = torch.zeros(n_scene, dtype=torch.bool, device=self.pos_a.device)
+        if not self.road_edge:
+            return
+        pt = data["pt_token"]
+        is_edge = pt["pl_type"].long() == ROAD_EDGE_POLYGON
+        if self.road_edge_types is not None:
+            keep = torch.as_tensor(list(self.road_edge_types), device=is_edge.device)
+            is_edge &= torch.isin(pt["type"].long(), keep)
+        self._edges = pad_edge_segments(
+            data["map_save"]["traj_pos"], is_edge, pt["batch"], int(self.ta["num_graphs"])
+        )
+        # A logged start that already touches an edge (curb parking, map noise)
+        # makes the rule unsatisfiable; it is switched off for that scene.
+        self.edge_active = torch.ones_like(self.edge_active)
+        self.edge_active = self.ego_road_edge_gap() >= self.min_road_edge
 
     @torch.no_grad()
     def candidates(self) -> Candidates:
@@ -225,8 +301,12 @@ class SmartImagination(Imagination):
 
     @torch.no_grad()
     def true_margin(self) -> Tensor:
-        """Clearance-based margin [B] of the ego at the current step."""
-        return ((self.ego_clearance() - self.min_clearance) / self.clearance_scale).clamp(-1, 1)
+        """Margin [B] of the ego at the current step: min over the active rules."""
+        margin = ((self.ego_clearance() - self.min_clearance) / self.clearance_scale).clamp(-1, 1)
+        if self._edges is not None:
+            edge = (self.ego_road_edge_gap() - self.min_road_edge) / self.road_edge_scale
+            margin = torch.minimum(margin, edge.clamp(-1, 1))
+        return margin
 
     # ------------------------------------------------------------ accessors
     def latent(self) -> Tensor:
@@ -258,6 +338,30 @@ class SmartImagination(Imagination):
         is_self = self.ego.unsqueeze(1) == torch.arange(n_agent, device=pos.device).unsqueeze(0)
         gap = gap.masked_fill(~same_scene | is_self | ~valid.unsqueeze(0), BIG)
         return gap.amin(-1)
+
+    def ego_road_edge_gap(self) -> Tensor:
+        """Gap in metres between each ego and the nearest road edge of its scene.
+
+        Minimum over the 0.1 s poses of the token executed in the last step
+        (the current pose only, right after ``reset``). ``BIG`` where the rule
+        is off.
+        """
+        n_scene = self.ego.numel()
+        if self._edges is None:
+            return self.pos_a.new_full((n_scene,), BIG)
+        if self._ego_sweep is None:
+            pos = self.pos_a[self.ego, -1].unsqueeze(1)  # [B, 1, 2]
+            head = self.head_a[self.ego, -1].unsqueeze(1)
+        else:
+            pos = self._ego_sweep.mean(-2)  # [B, S, 2]
+            forward = self._ego_sweep[..., 0, :] - self._ego_sweep[..., 3, :]
+            head = torch.atan2(forward[..., 1], forward[..., 0])
+        size = self.ta["token_agent_shape"][self.ego].flip(-1).unsqueeze(1)  # (length, width)
+        centers, radius = circle_cover(pos, head, size, self.n_circles)  # [B, S, C, 2], [B, S]
+        scene = self.ta["batch"][self.ego]
+        seg_a, seg_b, mask = (x[scene] for x in self._edges)
+        gap = road_edge_gap(centers.flatten(1, 2), radius[:, 0], seg_a, seg_b, mask)
+        return torch.where(self.edge_active, gap, torch.full_like(gap, BIG))
 
     # -------------------------------------------------------------- internals
     def _sample_tokens(self, logits: Tensor) -> Tensor:
@@ -364,6 +468,7 @@ class SmartImagination(Imagination):
         token_traj_global = transform_to_global(
             next_token_traj_all.flatten(1, 2), self.pos_a[:, t_now], self.head_a[:, t_now]
         ).view(*next_token_traj_all.shape)
+        self._ego_sweep = token_traj_global[self.ego]
 
         pos_a_next = token_traj_global[:, -1].mean(dim=1)
         diff_xy_next = token_traj_global[:, -1, 0] - token_traj_global[:, -1, 3]

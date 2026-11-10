@@ -50,7 +50,9 @@ def main() -> None:
         worst = max(worst, err)
         print(f"batch {i}: max position error {err:.2e} m, token agreement {idx_match:.4f}, "
               f"latent dim {z.shape[-1]}, egos {z.shape[0]}, "
-              f"final clearance min {env.ego_clearance().min().item():.2f} m")
+              f"final clearance min {env.ego_clearance().min().item():.2f} m, "
+              f"road-edge rule active {int(env.edge_active.sum())}/{z.shape[0]}, "
+              f"final road-edge gap min {env.ego_road_edge_gap().min().item():.2f} m")
         assert len(latents) == env.horizon + 1
 
     if worst > args.tol:

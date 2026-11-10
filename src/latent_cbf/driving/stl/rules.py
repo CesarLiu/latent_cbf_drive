@@ -124,6 +124,14 @@ def time_to_collision(
     return ttc.amin(0)
 
 
+def point_segment_distance(points: Tensor, seg_a: Tensor, seg_b: Tensor) -> Tensor:
+    """Distance from points [..., P, 2] to segments (a, b) [..., M, 2] -> [..., P, M]."""
+    a, ab = seg_a.unsqueeze(-3), (seg_b - seg_a).unsqueeze(-3)  # [..., 1, M, 2]
+    ap = points.unsqueeze(-2) - a  # [..., P, M, 2]
+    t = ((ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-12)).clamp(0.0, 1.0)
+    return (ap - t.unsqueeze(-1) * ab).norm(dim=-1)
+
+
 def road_edge_margin(traj: Trajectories, n_circles: int = 3) -> Tensor:
     """Gap [T] between the ego body and the nearest road-edge sample, in metres."""
     T = traj.ego_pos.shape[0]

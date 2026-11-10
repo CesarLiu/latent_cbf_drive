@@ -26,6 +26,7 @@ import torch
 
 from smart_common import add_smart_args, build_imagination
 
+from driving.adapters.smart_imagination import ROAD_EDGE_BOUNDARY
 from driving.conformal import sweep_alpha
 from driving.hj import AvoidQConfig, AvoidQLearner, MarginHead, QNetwork, fit_margin_head
 from driving.rollouts import calibration_rollouts, evaluate_policy
@@ -35,9 +36,10 @@ from driving.safety_filter import LatentSafetyFilter
 @torch.no_grad()
 def collect_latents(env, n_rollouts: int):
     """Latents and analytic margins along rollouts with random candidate tokens."""
-    zs, margins = [], []
+    zs, margins, edge_hit, edge_on = [], [], [], []
     for _ in range(n_rollouts):
         z = env.reset()
+        edge_on.append(env.edge_active.float())
         for _ in range(env.horizon):
             cand = env.candidates()
             # mostly nominal, sometimes a random candidate to reach unsafe states
@@ -50,11 +52,14 @@ def collect_latents(env, n_rollouts: int):
             keep = env.ego_valid()
             zs.append(z[keep])
             margins.append(env.true_margin()[keep])
-    return torch.cat(zs), torch.cat(margins)
+            edge_hit.append((env.ego_road_edge_gap()[keep] < env.min_road_edge).float())
+    stats = {"road_edge_rule_active": torch.cat(edge_on).mean().item(),
+             "road_edge_violation_fraction": torch.cat(edge_hit).mean().item()}
+    return torch.cat(zs), torch.cat(margins), stats
 
 
 def stage_probe(env, args, out: Path) -> None:
-    z, margin = collect_latents(env, args.rollouts)
+    z, margin, edge_stats = collect_latents(env, args.rollouts)
     n = z.shape[0]
     perm = torch.randperm(n, device=z.device)
     train, test = perm[: int(0.8 * n)], perm[int(0.8 * n):]
@@ -66,6 +71,7 @@ def stage_probe(env, args, out: Path) -> None:
     report = {
         "n_samples": n,
         "unsafe_fraction": (margin < 0).float().mean().item(),
+        **edge_stats,
         "train": metrics,
         "test_mae": (pred - margin[test]).abs().mean().item(),
         "test_sign_acc": ((pred < 0) == unsafe).float().mean().item(),
@@ -150,11 +156,20 @@ def main() -> None:
     parser.add_argument("--eval-batches", type=int, default=50)
     parser.add_argument("--prefix-steps", type=int, default=4)
     parser.add_argument("--clearance-scale", type=float, default=2.0)
+    parser.add_argument("--no-road-edge", action="store_true",
+                        help="margin from vehicle clearance only")
+    parser.add_argument("--road-edge-scale", type=float, default=1.0)
+    parser.add_argument("--boundary-only", action="store_true",
+                        help="ignore median road edges (TYPE_ROAD_EDGE_MEDIAN)")
     args = parser.parse_args()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    env, *_ = build_imagination(args, clearance_scale=args.clearance_scale)
+    env, *_ = build_imagination(
+        args, clearance_scale=args.clearance_scale, road_edge=not args.no_road_edge,
+        road_edge_scale=args.road_edge_scale,
+        road_edge_types=(ROAD_EDGE_BOUNDARY,) if args.boundary_only else None,
+    )
     {"probe": stage_probe, "train": stage_train, "eval": stage_eval}[args.stage](env, args, out)
 
 

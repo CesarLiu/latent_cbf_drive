@@ -14,7 +14,7 @@ The package depends only on torch; CAT-K and CtRL-Sim are reached through
 | `rollouts.py` | closed-loop evaluation and calibration rollouts in an imagination | 4, 5 | tested on the toy problem |
 | `toy/car_following.py` | stochastic car-following problem for the end-to-end test | - | tested |
 | `adapters/ctrlsim.py` | CtRL-Sim episode record to STL labels, planner wrapper with a safety hook | 2, 4 | unit tested with synthetic records, not run inside Nocturne |
-| `adapters/smart_imagination.py` | SMART (CAT-K) as a step-wise imagination | 1, 3 | **not executed yet**, run the check script first |
+| `adapters/smart_imagination.py` | SMART (CAT-K) as a step-wise imagination, clearance and road-edge margin | 1, 3 | road-edge geometry unit tested; model rollout **not executed yet**, run the check script first |
 
 ## Tests
 
@@ -45,6 +45,16 @@ All commands from `src/latent_cbf/`, in the CAT-K environment:
 * The critic is an expectation over the other agents' sampled behaviour, so
   `Q > 0` is optimistic. On the toy problem the uncalibrated filter leaves many
   violations and the conformal threshold is clearly above 0.
-* Still open: converting live Nocturne state into SMART's tokenized input, so
-  that the filter can run inside `PlannerAdversaryEvaluator` through
-  `FilteredPlanner`'s `safety_hook`.
+* The imagined margin is the minimum of vehicle clearance and the road-edge
+  gap. The road-edge gap uses the scene's road-edge polylines (`pl_type == 1`)
+  and all 0.1 s poses of the executed token, so an edge crossed inside a 0.5 s
+  step is caught. Limits: the distance is unsigned, so it is negative while the
+  body overlaps an edge and positive again once the ego is fully off-road (the
+  avoid value still records the crossing); egos whose logged start already
+  touches an edge get the rule switched off (`edge_active`); edges are not
+  closed at driveways. Flags: `--no-road-edge`, `--road-edge-scale`,
+  `--boundary-only`. The probe stage reports how often the rule is active and
+  violated; check these before training.
+* The Nocturne-to-SMART input bridge lives outside this package. What remains
+  here is to call it from `FilteredPlanner`'s `safety_hook` so the filter runs
+  inside `PlannerAdversaryEvaluator`.
